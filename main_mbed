@@ -1,0 +1,423 @@
+//Createde Date 2024/04/23
+//Author Ryoya Sato
+
+#include "mbed.h" 
+#include "CAN.h"
+#include "stdio.h"
+#include "cstring"
+#include "cstdio"
+#include "string.h"
+#include <cmath>
+
+
+//CANの定義
+CAN can1 (p30, p29);
+//UART定義
+Serial pc(USBTX,USBRX);
+Serial uart1(p13,p14);
+
+//AnalohIn
+AnalogIn Tension1( p15);
+AnalogIn Tension2( p16);
+
+//計算用変数
+float currentA, currentB;
+
+//EPOS CAN ID def
+#define ID_1_Tx_PDO01 0x181
+#define ID_1_Tx_PDO02 0x281
+#define ID_1_Tx_PDO03 0x381
+#define ID_1_Tx_PDO04 0x481
+
+#define ID_1_Rx_PDO01 0x201
+#define ID_1_Rx_PDO02 0x301
+#define ID_1_Rx_PDO03 0x401
+#define ID_1_Rx_PDO04 0x501
+
+//EPOS CAN ID def
+#define ID_2_Tx_PDO01 0x190
+#define ID_2_Tx_PDO02 0x290
+#define ID_2_Tx_PDO03 0x390
+#define ID_2_Tx_PDO04 0x490
+
+#define ID_2_Rx_PDO01 0x220
+#define ID_2_Rx_PDO02 0x320
+#define ID_2_Rx_PDO03 0x420
+#define ID_2_Rx_PDO04 0x520
+
+#define sync 0x80
+#define Reset 0x00
+
+//モータの定格トルク
+#define MOTOR_RATED_TORQUE 30.0f
+
+//指令トルク
+float desired_torque = 10.0f;
+
+float Torque1 = 0, Torque2 = 0;
+float voltage1, voltage2;
+float Vref1 = 2.495, Vref2 = 2.495;
+float Track_tension1, Track_tension2;
+
+float initial_torque = 10.0;
+float current_torque = initial_torque;
+const float MAX_TORQUE = 15.0f; // トルクの計測上限 (Nm)
+
+// トルク指令データ
+char Target_torque[4];
+
+// 時間計測用タイマー
+Timer timer;
+
+#define Torque_Const 0.0302 //[Nm/A]
+#define motor_efficiency 0.91 
+#define gear_efficiency 0.72
+#define ECY_efficiency 0.6
+#define gear_head_reduction_ratio 81
+#define ECY_reduction_ratio 50
+
+//char Profile_Velocity[4] = { 0x00, 0x00, 0x88, 0x13}; //5000rpm
+char Profile_Velocity[4] = { 0xC4, 0x09, 0x00, 0x00}; //2500rpm
+//char Profile_Velocity[4] = { 0xF4, 0x01, 0x00, 0x00}; //500rpm
+char Target_Torque[2] = {0x10,0x27};
+
+//char Profile_Velocity_re[4] = { 0x78, 0xEC, 0xFF, 0xFF}; //-5000rpm
+char Profile_Velocity_re[4] = { 0x3C, 0xF6, 0xFF, 0xFF}; //-2500rpm
+//char Profile_Velocity_re[4] = { 0x0C, 0xFE, 0xFF, 0xFF}; //-500rpm
+
+/////////////Data Frame/////////////
+//Mode of operation
+char OP3[1] = {0x03}; //PVM
+char OP9[1] = {0x09}; //CSV
+char OPA[1] = {0x0A}; //SCT
+
+char Conw1[2] = {0x06,0x00}; //Shutdown
+char Conw2[2] = {0x0F,0x00}; //Switchon & enable
+char Conw3[2] = {0x0B,0x00}; //Quick stop
+//starthoming actual value
+char Conw4[3] = { 0x00, 0x25, 0x00};
+char Conw5[3] = { 0x00, 0x0F, 0x00};
+char Conw6[3] = { 0x00, 0x01, 0x00};
+
+char ResetP1[4] = { 0x64, 0x00, 0x00, 0x00};
+char PreOP[2] = { 0x80, 0x00};
+char Operation[2] = { 0x01, 0x00};
+char Reset_NMT[2] = { 0x82, 0x00};
+
+char Read_Current1[4] = { 0x00, 0x00, 0x00, 0x00};
+char Read_Current2[4] = { 0x00, 0x00, 0x00, 0x00};
+
+char Actual_Torque1[2] = { 0x00, 0x00};
+char Actual_Torque2[2] = { 0x00, 0x00};
+
+char PVM[4] = { 0x03, 0x00, 0x64, 0x00};
+char SCV[3] = { 0x09, 0x00, 0x64};
+
+//////////CAN Message//////
+//Start Command//
+CANMessage NMTPRE( Reset, PreOP, 2);
+CANMessage NMTOP( Reset, Operation, 2);
+
+//receiv_read//
+CANMessage THE_P_Read1( ID_1_Tx_PDO02, Read_Current1, 4);
+CANMessage THE_C_Read2( ID_2_Tx_PDO02, Read_Current2, 4);
+
+//Current_read//
+CANMessage Read_Current1_1( ID_1_Tx_PDO03, Read_Current1, 4);
+CANMessage Read_Current2_1( ID_2_Tx_PDO03, Read_Current2, 4);
+
+//Torque_Read//
+CANMessage Actual_Torque1_1( ID_1_Tx_PDO03, Actual_Torque1, 2);
+CANMessage Actual_Torque2_1( ID_2_Tx_PDO03, Actual_Torque2, 2);
+
+
+
+char Operatio[2] = { 0x01, 0x00};
+char Reset_MMT[2] = { 0x82, 0x00};
+
+long DX1, DX2;
+float EX1, EX2;
+
+char STR1[5] = { '\0'};
+char STR2[5] = { '\0'};
+
+void DEXTRA1(){
+    DX1 = 0.001*strtol(STR1,NULL,16);
+}
+
+void DEXTRA2(){
+    DX2 = 0.001*strtol(STR2,NULL,16);
+}
+
+//個別コマンド
+CANMessage OP_Mode1_1(ID_1_Rx_PDO01, OP3, 1); //PVM
+CANMessage OP_Mode1_2(ID_1_Rx_PDO01, OP9, 1); //CSV
+CANMessage OP_Mode1_3(ID_1_Rx_PDO01, OPA, 1); //CST
+
+CANMessage ControlWord1_1(ID_1_Rx_PDO02, Conw1, 2);
+CANMessage ControlWord1_2(ID_1_Rx_PDO02, Conw2, 2);
+CANMessage ControlWord1_3(ID_1_Rx_PDO02, Conw3, 2);
+
+CANMessage OP_Mode2_1(ID_2_Rx_PDO01, OP3, 1); //PVM
+CANMessage OP_Mode2_2(ID_2_Rx_PDO01, OP9, 1); //CSV
+CANMessage OP_Mode2_3(ID_2_Rx_PDO01, OPA, 1); //CSV
+
+
+CANMessage ControlWord2_1(ID_2_Rx_PDO02, Conw1, 2);
+CANMessage ControlWord2_2(ID_2_Rx_PDO02, Conw2, 2);
+CANMessage ControlWord2_3(ID_2_Rx_PDO02, Conw3, 2);
+
+CANMessage Target_Velocity_1( ID_1_Rx_PDO03, Profile_Velocity, 4);
+CANMessage Target_Velocity_2( ID_2_Rx_PDO03, Profile_Velocity, 4);
+
+CANMessage Target_Velocity_re1( ID_1_Rx_PDO03, Profile_Velocity_re, 4);
+CANMessage Target_Velocity_re2( ID_2_Rx_PDO03, Profile_Velocity_re, 4);
+
+CANMessage Target_Torque_1( ID_1_Rx_PDO04, Target_torque, 2);
+CANMessage Target_Torque_2( ID_2_Rx_PDO04, Target_torque, 2);
+
+
+int main(){
+    int i = 0;
+    int vcaninchk1, vcaninchk2; 
+    char lan;
+    int mode = 0;
+   can1.frequency(1000000);
+   pc.baud(115200);   
+   uart1.baud(115200);
+   DigitalOut led1(LED1);
+   DigitalOut led2(LED2);
+   DigitalOut led3(LED3);
+   DigitalOut led4(LED4); 
+
+   //初期設定コマンド送信/////
+   can1.write(NMTPRE);
+    led1 = 1;
+   pc.printf("NMTPRE\n\r");
+   wait(0.5);
+  // ThisThread::sleep_for(200);
+   can1.write(NMTOP);
+    led2 = 1;
+   pc.printf("NMTOP\n\r");
+   //ThisThread::sleep_for(200); 
+   wait(0.5);
+
+   while(1){
+     can1.read(THE_P_Read1);
+     can1.read(THE_C_Read2);
+
+    if(uart1.readable()){
+        lan = uart1.getc();
+    }
+    switch(lan)
+    {
+        case 'F': //前進
+         can1.write(OP_Mode1_2);
+         can1.write(OP_Mode2_2);
+        led3 = 1;
+        wait(0.2);
+        
+        can1.write(ControlWord1_1);
+        can1.write(ControlWord2_1);
+        led4 = 1;
+        wait(0.2);
+        
+        can1.write(ControlWord1_2);
+        can1.write(ControlWord2_2);
+        wait(0.2);
+        
+        led4 = 1;
+        can1.write(Target_Velocity_1);   
+        can1.write(Target_Velocity_re2); 
+        wait(0.2);
+        
+        mode = 1;
+        lan = 0;
+        break;
+        
+        case 'B': //後進
+        can1.write(OP_Mode1_2);
+        can1.write(OP_Mode2_2);
+        led3 = 1;
+        wait(0.2);
+       
+        can1.write(ControlWord1_1);
+        can1.write(ControlWord2_1);
+        led4 = 1;
+        wait(0.2);
+       
+        can1.write(ControlWord1_2);
+        can1.write(ControlWord2_2);
+        wait(0.2);
+        
+        can1.write(Target_Velocity_re1);       
+        can1.write(Target_Velocity_2);   
+        wait(0.2);
+          
+        mode = 2;
+        lan = 0;
+        break;
+
+        case 'E': //左信地旋回 片方制動
+        can1.write(OP_Mode2_2);
+        can1.write(ControlWord2_1);
+        led3 = 1;
+        wait(0.2);
+        
+        can1.write(ControlWord2_2);
+        led4 = 1;
+        can1.write(Target_Velocity_re2);
+        wait(0.2);
+        
+        mode = 3;
+        lan = 0;
+        break;
+
+        case 'R': //左超信地旋回
+            can1.write(OP_Mode1_2);
+            can1.write(OP_Mode2_2);
+            led3 = 1;
+            wait(0.2);
+            //ThisThread::sleep_for(1);
+            can1.write(ControlWord1_1);
+            can1.write(ControlWord2_1);
+            wait(0.2);
+            //ThisThread::sleep_for(1);
+            can1.write(ControlWord1_2);
+            can1.write(ControlWord2_2);
+            led4 = 1;
+            wait(0.2);
+            //ThisThread::sleep_for(1);
+            can1.write(Target_Velocity_re1);
+            can1.write(Target_Velocity_re2); 
+            wait(0.2); 
+            //ThisThread::sleep_for(1);
+            mode = 4;
+            lan = 0;
+        break;
+
+        case 'T': //右信地旋回
+            can1.write(OP_Mode1_2);
+            can1.write(ControlWord1_1);
+            led3 = 1;
+            wait(0.2);
+            //ThisThread::sleep_for(1);
+            can1.write(ControlWord1_2);
+            can1.write(Target_Velocity_1);
+            led4= 1;  
+            mode = 5;
+            lan = 0;
+            wait(0.2);
+            //ThisThread::sleep_for(1);
+        break;
+
+        case 'Y': //右超信地旋回
+            can1.write(OP_Mode1_2);
+            can1.write(OP_Mode2_2);
+            led3 = 1;
+            wait(0.2);
+            //ThisThread::sleep_for(1);
+            can1.write(ControlWord1_1);
+            can1.write(ControlWord2_1);
+            led4 = 1;
+            wait(0.2);
+            //ThisThread::sleep_for(1);
+            can1.write(ControlWord1_2);
+            can1.write(ControlWord2_2);
+            wait(0.2);
+            //ThisThread::sleep_for(1);
+            can1.write(Target_Velocity_1); 
+            can1.write(Target_Velocity_2); 
+            wait(0.2);
+            //ThisThread::sleep_for(1);
+            mode = 6;
+            lan = 0;
+        break;
+
+        case 'P':
+            can1.write(OP_Mode1_3);
+            can1.write(OP_Mode2_3);
+            led3 = 1;
+            wait(0.2);
+
+          /*  can1.write(ControlWord1_1);
+            can1.write(ControlWord2_1);
+            led4 = 1;
+            wait(0.2);
+
+            can1.write(ControlWord1_2);
+            can1.write(ControlWord2_2);
+            wait(0.2);
+            */
+            can1.write(Target_Torque_1); 
+            can1.write(Target_Torque_2);
+            
+            wait(0.2);
+
+            mode = 7;
+            lan = 0;
+        break;
+
+        case 'S':
+            mode = 0;
+            lan = 0;
+        break;
+    }
+    
+    if(mode == 0){
+        can1.write(ControlWord1_3);
+        can1.write(ControlWord2_3);
+        led3 = 0;
+        led4 = 0;
+    }
+    if(mode == 1){
+        //前進
+        can1.write(Target_Velocity_1);   
+        can1.write(Target_Velocity_re2);
+    }
+
+    if(mode == 2){
+        can1.write(Target_Velocity_re1); 
+        can1.write(Target_Velocity_2); 
+    }
+
+    if(mode == 3){
+        can1.write(Target_Velocity_re2);   
+    }
+
+    if(mode == 4){
+        can1.write(Target_Velocity_re1);
+        can1.write(Target_Velocity_re2);   
+    }
+
+    if(mode == 5){
+        can1.write(Target_Velocity_1);    
+    }
+
+    if(mode == 6){
+        can1.write(Target_Velocity_1); 
+        can1.write(Target_Velocity_2); 
+   }
+
+   if(mode == 7){
+        can1.write(Target_Torque_1); 
+        can1.write(Target_Torque_2); 
+   }
+
+   if(THE_P_Read1.id == 0x281){ //Actual Currentに変更する
+       memcpy(Read_Current1_1.data, THE_P_Read1.data, 5);
+       snprintf(STR1, 11, "%02x%02x%02x%02x", Read_Current1_1.data[3], Read_Current1_1.data[2],Read_Current1_1.data[1], Read_Current1_1.data[0]);
+       DX1 = strtoul(STR1, NULL, 16);
+       currentA = abs(0.001f*static_cast<float>(DX1));
+       Torque1 = Torque_Const*gear_head_reduction_ratio*ECY_reduction_ratio*gear_efficiency*ECY_efficiency*currentA;
+   }else if(THE_C_Read2.id == 0x290){// Actual Currentに変更する
+       memcpy(Read_Current2_1.data, THE_C_Read2.data, 5);
+       snprintf(STR2, 11, "%02x%02x%02x%02x", Read_Current2_1.data[3], Read_Current2_1.data[2],Read_Current2_1.data[1], Read_Current2_1.data[0]);
+       DX2 = strtoul(STR2, NULL, 16);
+       currentB = abs(0.001f*static_cast<float>(DX2));
+       Torque2 = Torque_Const*gear_head_reduction_ratio*ECY_reduction_ratio*gear_efficiency*ECY_efficiency*currentB;
+   }
+   pc.printf("A : %f[A] : %f[Nm], B : %f[A] : %f[Nm]\r\n", currentA, Torque1, currentB, Torque2); //左右どちらがAorBか確認する A:正面から右 B:正面から左
+    wait_ms(10);
+  }
+}
